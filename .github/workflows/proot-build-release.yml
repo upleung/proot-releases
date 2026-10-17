@@ -1,0 +1,393 @@
+name: Auto Sync & Build Multi-Arch PRoot
+
+on:
+  # 每月 1 日 UTC 02:28（北京时间 10:28）同步上游并重新构建
+  schedule:
+    - cron: "28 2 1 * *"
+
+  # 手动运行：release_tag 留空时自动选择版本
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "发布版本 Tag；留空时自动选择或递增版本号，例如 v5.5.1"
+        required: false
+        default: ""
+        type: string
+      force_build:
+        description: "强制构建；指定了已存在的 Release Tag 时允许覆盖该版本资产"
+        required: false
+        default: false
+        type: boolean
+
+  # 推送 v* 标签时也可以触发构建；该标签必须存在于上游 proot-me/proot
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: proot-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-and-check:
+    name: Sync Upstream & Select Version
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      upstream_date: ${{ steps.check.outputs.upstream_date }}
+    steps:
+      - name: Checkout This Fork
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Fetch Upstream, Sync Fork, and Select Release Tag
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -Eeuo pipefail
+
+          UPSTREAM_URL="https://github.com/proot-me/proot.git"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch upstream +refs/heads/master:refs/remotes/upstream/master --no-tags
+
+          UPSTREAM_MASTER_SHA="$(git rev-parse refs/remotes/upstream/master)"
+          UPSTREAM_TAG="$(gh api repos/proot-me/proot/releases/latest --jq '.tag_name' 2>/dev/null || true)"
+          if [[ -z "$UPSTREAM_TAG" ]]; then
+            UPSTREAM_TAG="$(git ls-remote --tags --refs "$UPSTREAM_URL" 'refs/tags/v*' \
+              | awk '{ sub("refs/tags/", "", $2); print $2 }' \
+              | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+              | sort -V | tail -n 1 || true)"
+          fi
+          if [[ "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+            UPSTREAM_TAG="${UPSTREAM_TAG}.0"
+          fi
+          if [[ ! "$UPSTREAM_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "无法确定上游最新正式版 Tag：${UPSTREAM_TAG:-empty}" >&2
+            exit 1
+          fi
+
+          echo "上游 master: $UPSTREAM_MASTER_SHA"
+          echo "上游最新正式版: $UPSTREAM_TAG"
+
+          # 手动推送标签事件：从上游获取同名 Tag 并固定到该 Tag 对应的 commit。
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            PUSHED_TAG="$GITHUB_REF_NAME"
+            if [[ ! "$PUSHED_TAG" =~ ^v[0-9]+(\.[0-9]+){1,2}$ ]]; then
+              echo "不支持的版本标签格式：$PUSHED_TAG" >&2
+              exit 1
+            fi
+            git fetch upstream "+refs/tags/${PUSHED_TAG}:refs/tags/upstream-trigger/${PUSHED_TAG}" --force
+            SOURCE_SHA="$(git rev-parse "refs/tags/upstream-trigger/${PUSHED_TAG}^{commit}")"
+          else
+            SOURCE_SHA="$UPSTREAM_MASTER_SHA"
+          fi
+
+          SOURCE_DATE="$(git show -s --format=%cs "$SOURCE_SHA")"
+          SOURCE_SHORT="${SOURCE_SHA:0:7}"
+          echo "待构建的上游 commit: $SOURCE_SHA ($SOURCE_DATE)"
+
+          # 自动同步 fork 的 master。即使合并冲突，也继续使用上面固定的上游 commit 构建，
+          # 避免 fork 的同步状态影响二进制的可复现性。
+          if [[ "$GITHUB_EVENT_NAME" != "push" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            if git checkout master 2>/dev/null; then
+              :
+            else
+              git checkout -b master
+            fi
+            if git merge --no-edit upstream/master; then
+              if ! git push origin HEAD:master; then
+                echo "警告：无法推送同步后的 master；构建仍使用固定的上游 commit。"
+              fi
+            else
+              git merge --abort 2>/dev/null || true
+              echo "警告：同步 master 时发生冲突；已中止合并，但继续构建上游 commit。"
+            fi
+          fi
+
+          # 读取本仓库最新 Release，用于避免无变化时重复发布。
+          LATEST_RELEASE_JSON="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName,body 2>/dev/null || printf '{}')"
+          LAST_TAG="$(jq -r '.tagName // empty' <<< "$LATEST_RELEASE_JSON")"
+          LAST_BODY="$(jq -r '.body // empty' <<< "$LATEST_RELEASE_JSON")"
+          SOURCE_ALREADY_PUBLISHED=false
+          if [[ "$LAST_BODY" == *"$SOURCE_SHA"* || "$LAST_BODY" == *"$SOURCE_SHORT"* ]]; then
+            SOURCE_ALREADY_PUBLISHED=true
+          fi
+
+          release_exists() {
+            gh release view "$1" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1
+          }
+
+          normalize_tag() {
+            local tag="$1"
+            [[ "$tag" == v* ]] || tag="v${tag}"
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+              tag="${tag}.0"
+            fi
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "无效的 Release Tag：$tag；要求格式为 vX.Y.Z" >&2
+              return 1
+            fi
+            printf '%s' "$tag"
+          }
+
+          next_release_tag() {
+            # 上游正式版还没在本仓库发布过时，优先使用上游正式版号。
+            if ! release_exists "$UPSTREAM_TAG"; then
+              printf '%s' "$UPSTREAM_TAG"
+              return
+            fi
+
+            local base="$LAST_TAG"
+            if [[ ! "$base" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              base="$UPSTREAM_TAG"
+            fi
+            if [[ "$base" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              local major="${BASH_REMATCH[1]}"
+              local minor="${BASH_REMATCH[2]}"
+              local patch="${BASH_REMATCH[3]}"
+              printf 'v%s.%s.%s' "$major" "$minor" "$((patch + 1))"
+            else
+              echo "无法从本仓库/上游版本号计算下一个 Tag" >&2
+              return 1
+            fi
+          }
+
+          SHOULD_BUILD=true
+          TARGET_TAG=""
+          FORCE_BUILD="${FORCE_BUILD:-false}"
+
+          case "$GITHUB_EVENT_NAME" in
+            push)
+              TARGET_TAG="$(normalize_tag "$GITHUB_REF_NAME")"
+              ;;
+
+            workflow_dispatch)
+              if [[ -n "${INPUT_TAG:-}" ]]; then
+                TARGET_TAG="$(normalize_tag "$INPUT_TAG")"
+                if release_exists "$TARGET_TAG" && [[ "$FORCE_BUILD" != "true" ]]; then
+                  echo "Release $TARGET_TAG 已存在；如需覆盖，请勾选 force_build。"
+                  SHOULD_BUILD=false
+                fi
+              elif [[ "$SOURCE_ALREADY_PUBLISHED" == "true" ]]; then
+                if [[ "$FORCE_BUILD" == "true" ]]; then
+                  TARGET_TAG="$(normalize_tag "${LAST_TAG:-$UPSTREAM_TAG}")"
+                else
+                  echo "上游 commit $SOURCE_SHORT 已发布，跳过重复构建。"
+                  SHOULD_BUILD=false
+                fi
+              else
+                TARGET_TAG="$(next_release_tag)"
+              fi
+              ;;
+
+            schedule)
+              # 按需求每月都重新构建。源码未变化时更新当前对应 Release，避免无意义地递增补丁号；
+              # 如果上游发布了新正式版 Tag，则优先创建对应版本的 Release。
+              if [[ "$SOURCE_ALREADY_PUBLISHED" == "true" ]]; then
+                if ! release_exists "$UPSTREAM_TAG"; then
+                  TARGET_TAG="$UPSTREAM_TAG"
+                else
+                  TARGET_TAG="$(normalize_tag "${LAST_TAG:-$UPSTREAM_TAG}")"
+                fi
+              else
+                TARGET_TAG="$(next_release_tag)"
+              fi
+              ;;
+
+            *)
+              echo "不支持的触发事件：$GITHUB_EVENT_NAME" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream_date=$SOURCE_DATE" >> "$GITHUB_OUTPUT"
+          echo "最终结果：should_build=$SHOULD_BUILD release_tag=${TARGET_TAG:-none} source=$SOURCE_SHA"
+
+  build:
+    name: Build ${{ matrix.arch_label }} (${{ matrix.platform }})
+    needs: sync-and-check
+    if: needs.sync-and-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: amd64
+            arch_name: x86_64
+            platform: linux/amd64
+          - arch_label: arm64
+            arch_name: aarch64
+            platform: linux/arm64
+          - arch_label: arm32
+            arch_name: arm
+            platform: linux/arm/v7
+    steps:
+      - name: Checkout Exact Upstream Commit
+        uses: actions/checkout@v7
+        with:
+          repository: proot-me/proot
+          ref: ${{ needs.sync-and-check.outputs.upstream_sha }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+        with:
+          platforms: amd64,arm64,arm
+
+      - name: Build Statically Linked PRoot
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync-and-check.outputs.release_tag }}
+          ARCH_NAME: ${{ matrix.arch_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -Eeuo pipefail
+          BIN_NAME="proot-${RELEASE_TAG}-${ARCH_NAME}-static"
+          CLEAN_VER="${RELEASE_TAG#v}"
+
+          docker run --rm --platform "$PLATFORM" \
+            -e "BIN_NAME=$BIN_NAME" \
+            -e "CLEAN_VER=$CLEAN_VER" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            alpine:3.24 sh -euxc '
+              apk add --no-cache \
+                build-base \
+                talloc-dev \
+                talloc-static \
+                bsd-compat-headers \
+                linux-headers \
+                uthash-dev \
+                git \
+                coreutils \
+                binutils \
+                file
+
+              git config --global --add safe.directory /workspace
+              make -C src clean
+
+              # 固定程序内显示的版本号；不再依赖脆弱的 -ltalloc 字符串替换。
+              grep -Eq "^VERSION[[:space:]]*=" src/GNUmakefile
+              sed -i -E "s/^VERSION[[:space:]]*=.*/VERSION = ${CLEAN_VER}/" src/GNUmakefile
+              grep -Fqx "VERSION = ${CLEAN_VER}" src/GNUmakefile
+
+              # 按上游官方 CI 的方式把 -static 传入链接阶段。
+              # WITHOUT_PYTHON=1 防止意外启用 Python/SWIG 扩展影响静态链接。
+              # -fomit-frame-pointer 保留 ARM32 构建所需的兼容性设置。
+              CFLAGS="-fomit-frame-pointer" LDFLAGS="-static" \
+                make -C src V=1 proot WITHOUT_PYTHON=1 GIT=false
+
+              strip src/proot
+              cp src/proot "/workspace/${BIN_NAME}"
+              chmod 755 "/workspace/${BIN_NAME}"
+
+              echo "=== Binary information ==="
+              file "/workspace/${BIN_NAME}"
+              readelf -h "/workspace/${BIN_NAME}" | grep -E "Class:|Machine:"
+              "/workspace/${BIN_NAME}" --version
+
+              # 不能只看文件大小：强制检查无动态解释器、无 DT_NEEDED 动态库依赖。
+              if readelf -l "/workspace/${BIN_NAME}" | grep -q "INTERP"; then
+                echo "ERROR: binary has PT_INTERP; it is not fully static." >&2
+                exit 1
+              fi
+              if readelf -d "/workspace/${BIN_NAME}" 2>&1 | grep -q "NEEDED"; then
+                echo "ERROR: binary has DT_NEEDED shared-library dependencies." >&2
+                exit 1
+              fi
+              echo "Static-link verification passed."
+            '
+
+      - name: Upload Compiled Binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: proot-bin-${{ matrix.arch_label }}
+          path: proot-${{ needs.sync-and-check.outputs.release_tag }}-${{ matrix.arch_name }}-static
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish Release ${{ needs.sync-and-check.outputs.release_tag }}
+    needs: [sync-and-check, build]
+    if: needs.sync-and-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout This Fork
+        uses: actions/checkout@v7
+
+      - name: Download All Binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify Artifacts and Generate Checksums
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync-and-check.outputs.release_tag }}
+        run: |
+          set -Eeuo pipefail
+          cd dist
+          chmod 755 proot-*
+
+          count="$(find . -maxdepth 1 -type f -name 'proot-*' | wc -l)"
+          if [[ "$count" -ne 3 ]]; then
+            echo "预期 3 个架构二进制，实际找到 $count 个。" >&2
+            ls -lah
+            exit 1
+          fi
+
+          sha256sum proot-* > SHA256SUMS
+          echo "=== Release files ==="
+          ls -lh
+          cat SHA256SUMS
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.sync-and-check.outputs.release_tag }}
+          target_commitish: master
+          name: PRoot ${{ needs.sync-and-check.outputs.release_tag }} (Multi-Arch Static)
+          make_latest: true
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            ### PRoot ${{ needs.sync-and-check.outputs.release_tag }} — multi-architecture static build
+
+            Built from the exact upstream commit recorded below. The binaries are built with Alpine Linux/musl and statically link talloc and libc. The workflow verifies that ELF `PT_INTERP` and `DT_NEEDED` entries are absent before publishing.
+
+            - **Upstream repository:** https://github.com/proot-me/proot
+            - **Upstream commit:** `${{ needs.sync-and-check.outputs.upstream_sha }}`
+            - **Upstream commit date:** `${{ needs.sync-and-check.outputs.upstream_date }}`
+            - **Build environment:** Alpine Linux 3.24, musl, static talloc
+
+            | Architecture | Target | Output asset |
+            | --- | --- | --- |
+            | amd64 | x86_64 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-x86_64-static` |
+            | arm64 | aarch64 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-aarch64-static` |
+            | arm32 | ARMv7 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-arm-static` |
+
+            `SHA256SUMS` contains checksums for all three binaries.
+          files: |
+            dist/proot-*
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
