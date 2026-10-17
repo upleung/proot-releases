@@ -1,0 +1,289 @@
+name: Auto Sync & Build Multi-Arch PRoot
+
+on:
+  # 1. 每天定时自动巡检上游仓库 (北京时间每天 10:00)
+  schedule:
+    - cron: '0 2 * * *'
+
+  # 2. 手动触发：支持直接指定 v5.5.0 立即拉取最新上游源码并编译发布
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '指定发布的版本 Tag (格式如 v5.5.0，留空则自动检测计算)'
+        required: false
+        default: 'v5.5.0'
+      force_build:
+        description: '是否强制重新编译并覆盖发布该 Tag'
+        type: boolean
+        default: true
+
+  # 3. 推送 v* 标签时自动触发
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ==========================================
+  # 阶段 1：同步上游最新源码 & 智能计算版本标签
+  # ==========================================
+  sync-and-check:
+    name: Sync Upstream & Check Version
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      upstream_date: ${{ steps.check.outputs.upstream_date }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync Upstream & Detect New Version
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -e
+          # 1. 添加上游官方仓库并拉取最新源码与标签
+          git remote add upstream https://github.com/proot-me/proot.git || true
+          git fetch upstream master --tags
+
+          UPSTREAM_SHA=$(git rev-parse --short upstream/master)
+          UPSTREAM_FULL_SHA=$(git rev-parse upstream/master)
+          UPSTREAM_DATE=$(git log -1 --format=%cs upstream/master)
+          echo "upstream_sha=${UPSTREAM_SHA}" >> $GITHUB_OUTPUT
+          echo "upstream_date=${UPSTREAM_DATE}" >> $GITHUB_OUTPUT
+          echo "上游最新 Commit: ${UPSTREAM_SHA} (${UPSTREAM_DATE})"
+
+          # 2. 尝试自动同步上游 master 到本仓库 master 分支
+          if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git checkout master || git checkout -b master
+            if git merge upstream/master --no-edit; then
+              git push origin master || echo "提示: 上游包含 workflow 变更，跳过自动 push 分支，直接基于上游最新源码构建"
+            else
+              git merge --abort || true
+            fi
+          fi
+
+          # 3. 获取本仓库当前已发布的最新 Release 信息
+          LATEST_RELEASE_JSON=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName,body 2>/dev/null || echo "{}")
+          LAST_TAG=$(echo "${LATEST_RELEASE_JSON}" | jq -r '.tagName // empty')
+          LAST_BODY=$(echo "${LATEST_RELEASE_JSON}" | jq -r '.body // empty')
+          echo "当前仓库最新 Release Tag: ${LAST_TAG:-无}"
+
+          # 4. 判定触发方式与目标版本号 (规范化为 vX.Y.Z 格式，例如 v5.5.0)
+          SHOULD_BUILD="false"
+          TARGET_TAG=""
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            SHOULD_BUILD="true"
+            TARGET_TAG="${GITHUB_REF_NAME}"
+
+          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            SHOULD_BUILD="true"
+            if [ -n "${INPUT_TAG}" ]; then
+              TARGET_TAG="${INPUT_TAG}"
+            else
+              TARGET_TAG="v5.5.0"
+            fi
+
+          else
+            # 定时任务 (schedule)：检查上游 Commit SHA 是否已经编译发布过
+            if [[ "${LAST_BODY}" == *"${UPSTREAM_SHA}"* ]] && [ "${FORCE_BUILD}" != "true" ]; then
+              echo "上游源码 (${UPSTREAM_SHA}) 未发生更新，无需重复编译。"
+              SHOULD_BUILD="false"
+            else
+              echo "检测到上游新版本源码 (${UPSTREAM_SHA})，准备开始自动编译！"
+              SHOULD_BUILD="true"
+
+              # 检查上游是否有新 Tag，并规范化为 vX.Y.Z
+              UPSTREAM_TAG=$(git describe --tags --abbrev=0 upstream/master 2>/dev/null || echo "v5.5.0")
+              # 若形如 v5.5 则补齐为 v5.5.0
+              if [[ "${UPSTREAM_TAG}" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+                UPSTREAM_TAG="${UPSTREAM_TAG}.0"
+              fi
+
+              if [ -z "${LAST_TAG}" ] || [ "${LAST_TAG}" = "v5.4.0" ] \vert{}\vert{} [ "${LAST_TAG}" = "v5.3.0" ]; then
+                # 首次升级到 v5.5 系列，直接使用 v5.5.0
+                TARGET_TAG="v5.5.0"
+              elif [ "${UPSTREAM_TAG}" != "${LAST_TAG}" ] && ! gh release view "${UPSTREAM_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+                TARGET_TAG="${UPSTREAM_TAG}"
+              else
+                # 如果上游更新了源码但没打新 Tag，则在当前最新 Tag (如 v5.5.0) 基础上自动递增修订号 (-> v5.5.1)
+                BASE_VER="${LAST_TAG#v}"
+                MAJOR=$(echo "${BASE_VER}" | cut -d. -f1)
+                MINOR=$(echo "${BASE_VER}" | cut -d. -f2)
+                PATCH=$(echo "${BASE_VER}" | cut -d. -f3)
+                PATCH=$((${PATCH:-0} + 1 ))
+                TARGET_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+              fi
+            fi
+          fi
+
+          # 统一确保 Tag 以 v 开头且符合 vX.Y.Z 格式
+          [[ "${TARGET_TAG}" != v* ]] && TARGET_TAG="v${TARGET_TAG}"
+          if [[ "${TARGET_TAG}" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+            TARGET_TAG="${TARGET_TAG}.0"
+          fi
+
+          echo "should_build=${SHOULD_BUILD}" >> $GITHUB_OUTPUT
+          echo "release_tag=${TARGET_TAG}" >> $GITHUB_OUTPUT
+          echo "最终判定结果 -> should_build: ${SHOULD_BUILD}, release_tag:${TARGET_TAG}"
+
+  # ==========================================
+  # 阶段 2：并行编译 amd64 / arm64 / arm32 静态二进制
+  # ==========================================
+  build:
+    name: Build (${{ matrix.arch_label }} /${{ matrix.arch_name }})
+    needs: sync-and-check
+    if: needs.sync-and-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: amd64
+            arch_name: x86_64
+            platform: linux/amd64
+          - arch_label: arm64
+            arch_name: aarch64
+            platform: linux/arm64
+          - arch_label: arm32
+            arch_name: arm
+            platform: linux/arm/v7
+
+    steps:
+      - name: Checkout Latest Upstream Source (with Submodules)
+        uses: actions/checkout@v4
+        with:
+          repository: proot-me/proot
+          ref: master
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up QEMU for Multi-Arch
+        uses: docker/setup-qemu-action@v3
+
+      - name: Compile Static PRoot (${{ matrix.arch_label }})
+        env:
+          RELEASE_TAG: ${{ needs.sync-and-check.outputs.release_tag }}
+          ARCH_NAME: ${{ matrix.arch_name }}
+        run: |
+          BIN_NAME="proot-${RELEASE_TAG}-${ARCH_NAME}-static"
+          CLEAN_VER="${RELEASE_TAG#v}"
+
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            alpine:3.20 sh -euxc "
+              # 1. 安装静态编译工具链与依赖头文件
+              apk update
+              apk add --no-cache \
+                build-base \
+                talloc-dev \
+                talloc-static \
+                bsd-compat-headers \
+                linux-headers \
+                uthash-dev \
+                git \
+                coreutils \
+                file
+
+              git config --global --add safe.directory '*'
+              make -C src clean || true
+
+              # 2. 将当前发布版本号 (如 5.5.0) 写入 GNUmakefile，确保 proot --version 输出准确
+              sed -i 's/^VERSION.*/VERSION = ${CLEAN_VER}/g' src/GNUmakefile || true
+
+              # 3. 注入编译参数：
+              #    -fomit-frame-pointer: 解决 arm32 (armv7) 下 r7 寄存器与内联汇编冲突
+              #    -Wno-error: 防止高版本 GCC 警告中断构建
+              #    -static -ltalloc: 强制纯静态链接
+              sed -i '/CFLAGS.*+=/a CFLAGS += -fomit-frame-pointer -Wno-error' src/GNUmakefile
+              sed -i 's/-ltalloc/-static -ltalloc/g' src/GNUmakefile
+
+              # 4. 开始编译
+              make -C src V=1 proot
+
+              # 5. Strip 瘦身并导出二进制文件
+              strip src/proot
+              cp src/proot ./${BIN_NAME}
+              chmod +x ./${BIN_NAME}
+
+              # 6. 验证文件属性与版本输出
+              file ./${BIN_NAME}
+              ./${BIN_NAME} --version
+            "
+
+      - name: Upload Artifact (${{ matrix.arch_label }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: proot-bin-${{ matrix.arch_label }}
+          path: proot-${{ needs.sync-and-check.outputs.release_tag }}-${{ matrix.arch_name }}-static
+          if-no-files-found: error
+
+  # ==========================================
+  # 阶段 3：打包校验并自动发布到 GitHub Releases
+  # ==========================================
+  release:
+    name: Publish Release (${{ needs.sync-and-check.outputs.release_tag }})
+    needs: [sync-and-check, build]
+    if: needs.sync-and-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository (for Tagging)
+        uses: actions/checkout@v4
+
+      - name: Download All Compiled Binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          chmod +x proot-*
+          sha256sum proot-* > SHA256SUMS
+          cat SHA256SUMS
+          ls -lh
+
+      - name: Create Tag & Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync-and-check.outputs.release_tag }}
+          target_commitish: master
+          name: PRoot ${{ needs.sync-and-check.outputs.release_tag }} (Multi-Arch Static)
+          body: |
+            ### 🚀 PRoot ${{ needs.sync-and-check.outputs.release_tag }} 多架构纯静态编译版 (musl-libc)
+
+            基于上游官方仓库 [`proot-me/proot`](https://github.com/proot-me/proot) 最新源码自动同步构建，零外部动态库依赖，支持在受限容器环境下直接运行。
+
+            * **Upstream Commit**: `${{ needs.sync-and-check.outputs.upstream_sha }}` (${{ needs.sync-and-check.outputs.upstream_date }})
+            * **Build Environment**: Alpine Linux (`musl-libc` + `talloc-static`)
+
+            ---
+
+            #### 📦 架构与文件对照表
+
+            | 架构简称 | 标准架构名 | 适用设备 / 平台 | 编译产物文件名 |
+            | :--- | :--- | :--- | :--- |
+            | **`amd64`** | `x86_64` | PC / 服务器 / 云容器 (Intel / AMD 64位) | `proot-${{ needs.sync-and-check.outputs.release_tag }}-x86_64-static` |
+            | **`arm64`** | `aarch64` | ARMv8 / ARM64 服务器、盒子、树莓派 4/5、手机 Termux | `proot-${{ needs.sync-and-check.outputs.release_tag }}-aarch64-static` |
+            | **`arm32`** | `arm` (`armv7l`) | 玩客云 (OneCloud) 等 32位 ARMv7 / armhf 设备 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-arm-static` |
+          files: |
+            dist/proot-*
+            dist/SHA256SUMS
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
