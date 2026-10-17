@@ -1,0 +1,144 @@
+name: Build PRoot v5.3 Multi-Arch Static
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '发布到 Releases 的标签名 (留空则仅上传 Artifacts，例如填 v5.3.0)'
+        required: false
+        default: 'v5.3.0'
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+          - arch: arm64
+            platform: linux/arm64
+          - arch: arm32
+            platform: linux/arm/v7
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU for Multi-Arch
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build Static PRoot in Alpine (${{ matrix.arch }})
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            alpine:3.20 sh -euxc "
+              # 1. 安装静态编译依赖与兼容头文件
+              apk update
+              apk add --no-cache \
+                build-base \
+                talloc-dev \
+                talloc-static \
+                bsd-compat-headers \
+                linux-headers \
+                uthash-dev \
+                git \
+                coreutils \
+                file
+
+              # 2. 解决容器内 Git 目录权限校验问题
+              git config --global --add safe.directory '*'
+
+              # 3. 清理旧构建残留 (包括仓库自带的 bak 文件干扰)
+              make -C src clean || true
+
+              # 4. 优化 src/GNUmakefile 编译参数：
+              #    - 添加 -fomit-frame-pointer 解决 arm32 (armv7) r7 寄存器冲突
+              #    - 强制 -static 静态链接并确保 -ltalloc 置于链接末尾
+              sed -i '/CFLAGS   +=/a CFLAGS   += -fomit-frame-pointer' src/GNUmakefile
+              sed -i 's/LDFLAGS  += -ltalloc/LDFLAGS  += -static -ltalloc/g' src/GNUmakefile
+
+              # 5. 开始编译 PRoot
+              make -C src V=1 proot
+
+              # 6. 剥离调试符号减小体积并重命名
+              strip src/proot
+              cp src/proot ./proot-${{ matrix.arch }}
+              chmod +x ./proot-${{ matrix.arch }}
+
+              # 7. 验证产物架构、静态链接状态与版本运行测试
+              file ./proot-${{ matrix.arch }}
+              ./proot-${{ matrix.arch }} --version
+            "
+
+      - name: Upload Binary Artifact (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: proot-${{ matrix.arch }}
+          path: proot-${{ matrix.arch }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Multi-Arch Release
+    needs: build
+    runs-on: ubuntu-latest
+    # 当打 tag、手动触发或推送到主分支时打包汇总
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') || github.event_name == 'push'
+    steps:
+      - name: Download All Compiled Binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 Checksums
+        run: |
+          cd dist
+          chmod +x proot-*
+          sha256sum proot-* > SHA256SUMS
+          cat SHA256SUMS
+          ls -lh
+
+      - name: Upload Combined Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: proot-v5.3-all-archs
+          path: |
+            dist/proot-*
+            dist/SHA256SUMS
+
+      - name: Publish to GitHub Releases
+        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
+          name: PRoot ${{ inputs.release_tag || github.ref_name }} (amd64 / arm64 / arm32)
+          body: |
+            ### PRoot V5.3 多架构纯静态编译版 (musl-libc)
+            * **`proot-amd64`**: 适用于 `x86_64` / `amd64` 架构
+            * **`proot-arm64`**: 适用于 `aarch64` / `arm64` 架构
+            * **`proot-arm32`**: 适用于 `armv7l` / `armhf` (32位 ARM) 架构
+          files: |
+            dist/proot-amd64
+            dist/proot-arm64
+            dist/proot-arm32
+            dist/SHA256SUMS
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
