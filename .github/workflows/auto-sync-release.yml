@@ -1,14 +1,15 @@
 name: Auto Sync & Build Multi-Arch PRoot
 
 on:
+  # 1. 每月 1 号 UTC 02:28 (北京时间 10:28) 自动拉取同步上游并检查构建
   schedule:
     - cron: '28 2 1 * *'
 
-  # 2. 手动触发：支持直接指定 v5.5.0 立即拉取最新上游源码并编译发布
+  # 2. 手动触发：支持指定版本号 (默认 v5.5.0) 立即构建并发布
   workflow_dispatch:
     inputs:
       release_tag:
-        description: '指定发布的版本 Tag (格式如 v5.5.0，留空则自动检测计算)'
+        description: '指定发布的版本 Tag (留空则自动读取上游最新 Tag，如 v5.5.0)'
         required: false
         default: 'v5.5.0'
       force_build:
@@ -23,6 +24,10 @@ on:
 
 permissions:
   contents: write
+
+env:
+  # 消除 GitHub Actions Node.js 20 弃用警告
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   # ==========================================
@@ -50,93 +55,102 @@ jobs:
           FORCE_BUILD: ${{ inputs.force_build }}
         run: |
           set -e
-          # 1. 添加上游官方仓库并拉取最新源码与标签
-          git remote add upstream https://github.com/proot-me/proot.git || true
-          git fetch upstream master --tags
+
+          # 1. 获取本仓库当前已发布的最新 Release 信息
+          LATEST_RELEASE_JSON=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName,body 2>/dev/null || echo "{}")
+          LAST_TAG=$(echo "${LATEST_RELEASE_JSON}" | jq -r '.tagName // empty')
+          LAST_BODY=$(echo "${LATEST_RELEASE_JSON}" | jq -r '.body // empty')
+          echo "当前本仓库最新 Release Tag: ${LAST_TAG:-无}"
+
+          # 2. 添加上游官方仓库并强制拉取最新源码与所有标签 (解决同名 Tag 冲突报错)
+          git remote add upstream https://github.com/proot-me/proot.git 2>/dev/null || true
+          git fetch upstream master --tags --force
 
           UPSTREAM_SHA=$(git rev-parse --short upstream/master)
-          UPSTREAM_FULL_SHA=$(git rev-parse upstream/master)
           UPSTREAM_DATE=$(git log -1 --format=%cs upstream/master)
           echo "upstream_sha=${UPSTREAM_SHA}" >> $GITHUB_OUTPUT
           echo "upstream_date=${UPSTREAM_DATE}" >> $GITHUB_OUTPUT
           echo "上游最新 Commit: ${UPSTREAM_SHA} (${UPSTREAM_DATE})"
 
-          # 2. 尝试自动同步上游 master 到本仓库 master 分支
+          # 3. 自动获取上游最新的正式版 Tag (例如 v5.5.0)
+          UPSTREAM_TAG=$(git tag -l "v[0-9]*" --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' | head -n 1 || true)
+          if [ -z "${UPSTREAM_TAG}" ]; then
+            UPSTREAM_TAG="v5.5.0"
+          fi
+          # 若上游 Tag 形如 v5.5，自动规范化补齐为 v5.5.0
+          if [[ "${UPSTREAM_TAG}" =~ ^v[0-9]+\.[0-9]+$ ]]; then
+            UPSTREAM_TAG="${UPSTREAM_TAG}.0"
+          fi
+          echo "检测到上游最新规范化 Tag: ${UPSTREAM_TAG}"
+
+          # 4. 尝试将上游 master 同步合并到本仓库 master 分支
           if [ "${GITHUB_EVENT_NAME}" != "push" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git checkout master || git checkout -b master
+            git checkout master 2>/dev/null || git checkout -b master
             if git merge upstream/master --no-edit; then
-              git push origin master || echo "提示: 上游包含 workflow 变更，跳过自动 push 分支，直接基于上游最新源码构建"
+              git push origin master 2>/dev/null || echo "提示: 跳过分支推送，后续直接拉取上游最新源码编译"
             else
-              git merge --abort || true
+              git merge --abort 2>/dev/null || true
             fi
           fi
 
-          # 3. 获取本仓库当前已发布的最新 Release 信息
-          LATEST_RELEASE_JSON=$(gh release view --repo "${GITHUB_REPOSITORY}" --json tagName,body 2>/dev/null || echo "{}")
-          LAST_TAG=$(echo "${LATEST_RELEASE_JSON}" | jq -r '.tagName // empty')
-          LAST_BODY=$(echo "${LATEST_RELEASE_JSON}" | jq -r '.body // empty')
-          echo "当前仓库最新 Release Tag: ${LAST_TAG:-无}"
-
-          # 4. 判定触发方式与目标版本号 (规范化为 vX.Y.Z 格式，例如 v5.5.0)
+          # 5. 判定是否需要构建及最终发布的 Tag 名称
           SHOULD_BUILD="false"
           TARGET_TAG=""
 
-          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-            SHOULD_BUILD="true"
-            TARGET_TAG="${GITHUB_REF_NAME}"
-
-          elif [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            SHOULD_BUILD="true"
-            if [ -n "${INPUT_TAG}" ]; then
-              TARGET_TAG="${INPUT_TAG}"
-            else
-              TARGET_TAG="v5.5.0"
-            fi
-
-          else
-            # 定时任务 (schedule)：检查上游 Commit SHA 是否已经编译发布过
-            if [[ "${LAST_BODY}" == *"${UPSTREAM_SHA}"* ]] && [ "${FORCE_BUILD}" != "true" ]; then
-              echo "上游源码 (${UPSTREAM_SHA}) 未发生更新，无需重复编译。"
-              SHOULD_BUILD="false"
-            else
-              echo "检测到上游新版本源码 (${UPSTREAM_SHA})，准备开始自动编译！"
+          case "${GITHUB_EVENT_NAME}" in
+            push)
               SHOULD_BUILD="true"
-
-              # 检查上游是否有新 Tag，并规范化为 vX.Y.Z
-              UPSTREAM_TAG=$(git describe --tags --abbrev=0 upstream/master 2>/dev/null || echo "v5.5.0")
-              # 若形如 v5.5 则补齐为 v5.5.0
-              if [[ "${UPSTREAM_TAG}" =~ ^v[0-9]+\.[0-9]+$ ]]; then
-                UPSTREAM_TAG="${UPSTREAM_TAG}.0"
-              fi
-
-              if [ -z "${LAST_TAG}" ] || [ "${LAST_TAG}" = "v5.4.0" ] \vert{}\vert{} [ "${LAST_TAG}" = "v5.3.0" ]; then
-                # 首次升级到 v5.5 系列，直接使用 v5.5.0
-                TARGET_TAG="v5.5.0"
-              elif [ "${UPSTREAM_TAG}" != "${LAST_TAG}" ] && ! gh release view "${UPSTREAM_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-                TARGET_TAG="${UPSTREAM_TAG}"
+              TARGET_TAG="${GITHUB_REF_NAME}"
+              ;;
+            workflow_dispatch)
+              SHOULD_BUILD="true"
+              if [ -n "${INPUT_TAG}" ]; then
+                TARGET_TAG="${INPUT_TAG}"
               else
-                # 如果上游更新了源码但没打新 Tag，则在当前最新 Tag (如 v5.5.0) 基础上自动递增修订号 (-> v5.5.1)
-                BASE_VER="${LAST_TAG#v}"
-                MAJOR=$(echo "${BASE_VER}" | cut -d. -f1)
-                MINOR=$(echo "${BASE_VER}" | cut -d. -f2)
-                PATCH=$(echo "${BASE_VER}" | cut -d. -f3)
-                PATCH=$((${PATCH:-0} + 1 ))
-                TARGET_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+                TARGET_TAG="${UPSTREAM_TAG}"
               fi
-            fi
-          fi
+              ;;
+            *)
+              # 定时任务 (schedule)：对比最新 Release 中记录的 Upstream Commit SHA
+              if [[ "${LAST_BODY}" == *"${UPSTREAM_SHA}"* ]]; then
+                echo "上游源码 (${UPSTREAM_SHA}) 相比上次发布未发生变化，跳过本次构建。"
+                SHOULD_BUILD="false"
+              else
+                echo "发现上游源码更新 (${UPSTREAM_SHA})，开始自动编译构建！"
+                SHOULD_BUILD="true"
 
-          # 统一确保 Tag 以 v 开头且符合 vX.Y.Z 格式
-          [[ "${TARGET_TAG}" != v* ]] && TARGET_TAG="v${TARGET_TAG}"
+                # 若本仓库尚未发布过该上游 Tag (如 v5.5.0)，则直接使用该 Tag
+                if ! gh release view "${UPSTREAM_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+                  TARGET_TAG="${UPSTREAM_TAG}"
+                else
+                  # 若上游仅更新了源码但未打新 Tag，则在当前最新版本号基础上自动 +1 (如 v5.5.0 -> v5.5.1)
+                  BASE_VER="${LAST_TAG#v}"
+                  if [ -z "${BASE_VER}" ]; then
+                    BASE_VER="${UPSTREAM_TAG#v}"
+                  fi
+                  MAJOR=$(echo "${BASE_VER}" | cut -d. -f1)
+                  MINOR=$(echo "${BASE_VER}" | cut -d. -f2)
+                  PATCH=$(echo "${BASE_VER}" | cut -d. -f3)
+                  PATCH=$((${PATCH:-0} + 1 ))
+                  TARGET_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+                fi
+              fi
+              ;;
+          esac
+
+          # 统一确保 Tag 以 v 开头且为 vX.Y.Z 格式
+          if [[ "${TARGET_TAG}" != v* ]]; then
+            TARGET_TAG="v${TARGET_TAG}"
+          fi
           if [[ "${TARGET_TAG}" =~ ^v[0-9]+\.[0-9]+$ ]]; then
             TARGET_TAG="${TARGET_TAG}.0"
           fi
 
           echo "should_build=${SHOULD_BUILD}" >> $GITHUB_OUTPUT
           echo "release_tag=${TARGET_TAG}" >> $GITHUB_OUTPUT
-          echo "最终判定结果 -> should_build: ${SHOULD_BUILD}, release_tag:${TARGET_TAG}"
+          echo "判定结果 -> should_build: ${SHOULD_BUILD}, release_tag:${TARGET_TAG}"
 
   # ==========================================
   # 阶段 2：并行编译 amd64 / arm64 / arm32 静态二进制
@@ -200,25 +214,25 @@ jobs:
               git config --global --add safe.directory '*'
               make -C src clean || true
 
-              # 2. 将当前发布版本号 (如 5.5.0) 写入 GNUmakefile，确保 proot --version 输出准确
+              # 2. 将当前发布版本号写入 GNUmakefile，确保 proot --version 显示一致
               sed -i 's/^VERSION.*/VERSION = ${CLEAN_VER}/g' src/GNUmakefile || true
 
               # 3. 注入编译参数：
-              #    -fomit-frame-pointer: 解决 arm32 (armv7) 下 r7 寄存器与内联汇编冲突
-              #    -Wno-error: 防止高版本 GCC 警告中断构建
+              #    -fomit-frame-pointer: 解决 arm32 (armv7) 下 r7 寄存器冲突
+              #    -Wno-error: 避免高版本编译器警告中断构建
               #    -static -ltalloc: 强制纯静态链接
               sed -i '/CFLAGS.*+=/a CFLAGS += -fomit-frame-pointer -Wno-error' src/GNUmakefile
               sed -i 's/-ltalloc/-static -ltalloc/g' src/GNUmakefile
 
-              # 4. 开始编译
+              # 4. 编译 PRoot
               make -C src V=1 proot
 
-              # 5. Strip 瘦身并导出二进制文件
+              # 5. Strip 剥离符号减小体积并导出
               strip src/proot
               cp src/proot ./${BIN_NAME}
               chmod +x ./${BIN_NAME}
 
-              # 6. 验证文件属性与版本输出
+              # 6. 验证产物类型与版本信息
               file ./${BIN_NAME}
               ./${BIN_NAME} --version
             "
@@ -231,7 +245,7 @@ jobs:
           if-no-files-found: error
 
   # ==========================================
-  # 阶段 3：打包校验并自动发布到 GitHub Releases
+  # 阶段 3：打包校验并自动发布到 Releases (标记为 Latest)
   # ==========================================
   release:
     name: Publish Release (${{ needs.sync-and-check.outputs.release_tag }})
@@ -239,7 +253,7 @@ jobs:
     if: needs.sync-and-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository (for Tagging)
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Download All Compiled Binaries
@@ -256,12 +270,16 @@ jobs:
           cat SHA256SUMS
           ls -lh
 
-      - name: Create Tag & Publish to GitHub Releases
+      - name: Create Tag & Publish Latest Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.sync-and-check.outputs.release_tag }}
           target_commitish: master
           name: PRoot ${{ needs.sync-and-check.outputs.release_tag }} (Multi-Arch Static)
+          # 强制将最新发布的版本标记为 Latest
+          make_latest: true
+          draft: false
+          prerelease: false
           body: |
             ### 🚀 PRoot ${{ needs.sync-and-check.outputs.release_tag }} 多架构纯静态编译版 (musl-libc)
 
@@ -282,7 +300,5 @@ jobs:
           files: |
             dist/proot-*
             dist/SHA256SUMS
-          draft: false
-          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
