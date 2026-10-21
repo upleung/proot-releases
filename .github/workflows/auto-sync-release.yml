@@ -29,22 +29,24 @@ concurrency:
   group: proot-multiarch-release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   # ==========================================
   # 阶段 1：同步上游最新源码 & 确定版本标签
   # ==========================================
   sync-and-check:
     name: Sync Upstream & Check Version
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       release_tag: ${{ steps.check.outputs.release_tag }}
       upstream_sha: ${{ steps.check.outputs.upstream_sha }}
-      upstream_short_sha: ${{ steps.check.outputs.upstream_short_sha }}
       upstream_date: ${{ steps.check.outputs.upstream_date }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
@@ -71,7 +73,6 @@ jobs:
           UPSTREAM_FULL_SHA=$(git rev-parse upstream/master)
           UPSTREAM_DATE=$(git log -1 --format=%cs upstream/master)
           echo "upstream_sha=${UPSTREAM_FULL_SHA}" >> $GITHUB_OUTPUT
-          echo "upstream_short_sha=${UPSTREAM_SHA}" >> $GITHUB_OUTPUT
           echo "upstream_date=${UPSTREAM_DATE}" >> $GITHUB_OUTPUT
           echo "上游最新 Commit: ${UPSTREAM_FULL_SHA} (${UPSTREAM_DATE})"
 
@@ -132,7 +133,7 @@ jobs:
                   MAJOR=$(echo "${BASE_VER}" | cut -d. -f1)
                   MINOR=$(echo "${BASE_VER}" | cut -d. -f2)
                   PATCH=$(echo "${BASE_VER}" | cut -d. -f3)
-                  PATCH=$(( ${PATCH:-0} + 1 ))
+                  PATCH=$((${PATCH:-0} + 1 ))
                   TARGET_TAG="v${MAJOR}.${MINOR}.${PATCH}"
                 fi
               fi
@@ -148,16 +149,16 @@ jobs:
 
           echo "should_build=${SHOULD_BUILD}" >> $GITHUB_OUTPUT
           echo "release_tag=${TARGET_TAG}" >> $GITHUB_OUTPUT
-          echo "最终判定 -> should_build: ${SHOULD_BUILD}, release_tag: ${TARGET_TAG}"
+          echo "最终判定 -> should_build: ${SHOULD_BUILD}, release_tag:${TARGET_TAG}"
 
   # ==========================================
-  # 阶段 2：100% 采用上游 release.yml 原版逻辑编译 (Ubuntu 24.04 glibc + 不 strip)
+  # 阶段 2：100% 采用上游 release.yml 原版逻辑编译 (Ubuntu glibc + 不 strip)
   # ==========================================
   build:
-    name: Build (${{ matrix.arch_label }} / ${{ matrix.arch_name }})
+    name: Build (${{ matrix.arch_label }} /${{ matrix.arch_name }})
     needs: sync-and-check
     if: needs.sync-and-check.outputs.should_build == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -174,7 +175,7 @@ jobs:
 
     steps:
       - name: Checkout Exact Upstream Source
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
         with:
           repository: proot-me/proot
           ref: ${{ needs.sync-and-check.outputs.upstream_sha }}
@@ -183,11 +184,9 @@ jobs:
 
       - name: Set up QEMU (for arm64 & arm32)
         if: matrix.arch_label != 'amd64'
-        uses: docker/setup-qemu-action@v4
-        with:
-          platforms: arm64,arm
+        uses: docker/setup-qemu-action@v3
 
-      # 1. amd64 架构：直接在 ubuntu-24.04 宿主机上 100% 原样执行上游 release.yml 的命令
+      # 1. amd64 架构：直接在 ubuntu-latest 宿主机上 100% 原样执行上游 release.yml 的命令
       - name: Build amd64 (Exact Upstream release.yml Method)
         if: matrix.arch_label == 'amd64'
         env:
@@ -197,14 +196,16 @@ jobs:
           set -eux
           BIN_NAME="proot-${RELEASE_TAG}-${ARCH_NAME}-static"
 
+          # 完全一致的上游 release.yml 依赖安装步骤
           sudo apt-get update -qq
           sudo apt-get install -qq libarchive-dev libtalloc-dev pkg-config uthash-dev lzop g++
 
+          # 完全一致的上游 release.yml 编译步骤 (保留 -g 符号，绝不执行 strip)
           make -C src clean loader.elf loader-m32.elf build.h WITHOUT_PYTHON=1
           LDFLAGS="${LDFLAGS:-} -static" make -C src proot WITHOUT_PYTHON=1
 
           cp src/proot "./${BIN_NAME}"
-          chmod 755 "./${BIN_NAME}"
+          chmod +x "./${BIN_NAME}"
 
       # 2. arm64 / arm32 架构：在同源 Ubuntu 24.04 (glibc) 环境中按上游 release.yml 逻辑编译
       - name: Build arm64 & arm32 (Ubuntu glibc Upstream Method)
@@ -218,6 +219,7 @@ jobs:
           set -eux
           BIN_NAME="proot-${RELEASE_TAG}-${ARCH_NAME}-static"
 
+          # arm32 在 Ubuntu 24.04 Thumb-2 模式下需释放 r7 寄存器，通过环境变量追加，保留 GNUmakefile 自带的 -g -O2
           EXTRA_CFLAGS=""
           if [ "${ARCH_LABEL}" = "arm32" ]; then
             EXTRA_CFLAGS="-fomit-frame-pointer"
@@ -234,14 +236,15 @@ jobs:
 
               git config --global --add safe.directory /workspace
 
+              # 按上游 release.yml 分两步构建，链接 Ubuntu glibc 静态库且不执行 strip
               CFLAGS="${EXTRA_CFLAGS}" make -C src clean loader.elf build.h WITHOUT_PYTHON=1
               CFLAGS="${EXTRA_CFLAGS}" LDFLAGS="${LDFLAGS:-} -static" make -C src proot WITHOUT_PYTHON=1
             '
 
           cp src/proot "./${BIN_NAME}"
-          chmod 755 "./${BIN_NAME}"
+          chmod +x "./${BIN_NAME}"
 
-      # 3. 校验编译产物属性与文件体积 (> 1MB)
+      # 3. 校验编译产物属性与文件体积 (必须大于 1MB，amd64 约为 1.76MB)
       - name: Verify Binary Size (> 1MB) & Version
         env:
           RELEASE_TAG: ${{ needs.sync-and-check.outputs.release_tag }}
@@ -253,7 +256,7 @@ jobs:
           file "./${BIN_NAME}"
           "./${BIN_NAME}" --version
 
-          FILE_SIZE=$(stat -c%s "./${BIN_NAME}")
+          FILE_SIZE=$(stat -c\%s "./${BIN_NAME}")
           echo "编译产物字节大小: ${FILE_SIZE} bytes"
           if [ "${FILE_SIZE}" -lt 1000000 ]; then
             echo "::error::编译产物 ${BIN_NAME} 体积异常 (${FILE_SIZE} bytes < 1MB)！"
@@ -261,27 +264,26 @@ jobs:
           fi
 
       - name: Upload Artifact (${{ matrix.arch_label }})
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: proot-bin-${{ matrix.arch_label }}
           path: proot-${{ needs.sync-and-check.outputs.release_tag }}-${{ matrix.arch_name }}-static
           if-no-files-found: error
-          retention-days: 7
 
   # ==========================================
-  # 阶段 3：打包校验并发布双语 Release (标记为 Latest)
+  # 阶段 3：打包校验并发布到 GitHub Releases (标记为 Latest)
   # ==========================================
   release:
     name: Publish Release (${{ needs.sync-and-check.outputs.release_tag }})
     needs: [sync-and-check, build]
     if: needs.sync-and-check.outputs.should_build == 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Download All Compiled Binaries
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
@@ -289,19 +291,18 @@ jobs:
       - name: Generate SHA256SUMS
         run: |
           cd dist
-          chmod 755 proot-*
+          chmod +x proot-*
           sha256sum proot-* > SHA256SUMS
           cat SHA256SUMS
           ls -lh
 
       - name: Create or Update GitHub Release (Latest)
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.sync-and-check.outputs.release_tag }}
           target_commitish: master
           name: PRoot ${{ needs.sync-and-check.outputs.release_tag }} (Multi-Arch Static)
           make_latest: true
-          overwrite_files: true
           draft: false
           prerelease: false
           body: |
@@ -338,7 +339,7 @@ jobs:
             | **`amd64`** | `x86_64` | PC / 服务器 / 云容器 (Intel / AMD 64位) | `proot-${{ needs.sync-and-check.outputs.release_tag }}-x86_64-static` |
             | **`arm64`** | `aarch64` | ARMv8 / ARM64 服务器、电视盒子、树莓派 4/5、手机 Termux | `proot-${{ needs.sync-and-check.outputs.release_tag }}-aarch64-static` |
             | **`arm32`** | `arm` (`armv7l`) | 玩客云 (OneCloud) 等 32位 ARMv7 / armhf 嵌入式设备 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-arm-static` |
-
+            
           files: |
             dist/proot-*
             dist/SHA256SUMS
