@@ -1,4 +1,4 @@
-name: Auto Sync & Build Multi-Arch PRoot
+name: Auto Sync & Build Multi-Arch PRoot GPT
 
 on:
   # 每月 1 日 UTC 02:28（北京时间 10:28）同步上游并重新构建
