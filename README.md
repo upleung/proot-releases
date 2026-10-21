@@ -7,7 +7,6 @@
 [![GitHub Release](https://img.shields.io/github/v/release/upleung/proot-releases?style=flat-square&logo=github&label=Latest%20Release&color=2ea44f)](https://github.com/upleung/proot-releases/releases/latest)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/upleung/proot-releases/auto-sync-release.yml?style=flat-square&logo=githubactions&label=Multi-Arch%20Build)](https://github.com/upleung/proot-releases/actions)
 [![Architectures](https://img.shields.io/badge/Arch-amd64%20%7C%20arm64%20%7C%20arm32-007ec6?style=flat-square&logo=linux)](#)
-[![Build Base](https://img.shields.io/badge/Base-Ubuntu%2024.04%20(glibc%20static)-E95420?style=flat-square&logo=ubuntu)](#)
 [![License](https://img.shields.io/badge/License-GPL%20v2-blue?style=flat-square)](./COPYING)
 
 <br>
