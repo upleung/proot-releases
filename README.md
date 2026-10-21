@@ -78,6 +78,3 @@ chmod +x proot
 ## 📄 License
 
 This project is licensed under the [GNU General Public License v2.0 (GPL-2.0)](https://www.google.com/search?q=./COPYING), following the upstream repository.
-```
-
-```
