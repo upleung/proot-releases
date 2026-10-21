@@ -1,0 +1,402 @@
+name: Upstream Sync & Official-Style Static PRoot
+
+on:
+  # Monthly: 1st day at 02:28 UTC (10:28 China Standard Time).
+  schedule:
+    - cron: '28 2 1 * *'
+
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional tag; must match the version documented in upstream source (e.g. v5.5.0)'
+        required: false
+        default: ''
+        type: string
+      force_build:
+        description: 'Rebuild/update the release even if it already exists'
+        required: false
+        default: true
+        type: boolean
+
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: proot-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync-and-check:
+    name: Fetch Upstream & Validate Version
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.check.outputs.upstream_sha }}
+      upstream_date: ${{ steps.check.outputs.upstream_date }}
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch pinned upstream source and determine release tag
+        id: check
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          set -Eeuo pipefail
+
+          UPSTREAM_URL='https://github.com/proot-me/proot.git'
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_URL"
+          else
+            git remote add upstream "$UPSTREAM_URL"
+          fi
+          git fetch upstream '+refs/heads/master:refs/remotes/upstream/master'
+
+          if [[ "$GITHUB_EVENT_NAME" == 'push' ]]; then
+            PUSHED_TAG="$GITHUB_REF_NAME"
+            if [[ ! "$PUSHED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Invalid pushed tag: $PUSHED_TAG (expected vX.Y.Z)." >&2
+              exit 1
+            fi
+            git fetch upstream "+refs/tags/${PUSHED_TAG}:refs/tags/upstream/${PUSHED_TAG}"
+            SOURCE_SHA="$(git rev-parse "refs/tags/upstream/${PUSHED_TAG}^{commit}")"
+          else
+            SOURCE_SHA="$(git rev-parse refs/remotes/upstream/master)"
+          fi
+
+          SOURCE_DATE="$(git show -s --format=%cs "$SOURCE_SHA")"
+          DOC_VERSION="$(git show "${SOURCE_SHA}:doc/proot/manual.rst" | sed -n 's/^:Version:[[:space:]]*//p' | head -n 1 | tr -d '\r')"
+          HEADER_VERSION="$(git show "${SOURCE_SHA}:src/cli/proot.h" | sed -n 's/^#define VERSION "\(.*\)"/\1/p' | head -n 1 | tr -d '\r')"
+
+          if [[ -z "$DOC_VERSION" || -z "$HEADER_VERSION" ]]; then
+            echo 'Failed to read the upstream version from manual/header.' >&2
+            exit 1
+          fi
+          if [[ "$DOC_VERSION" != "$HEADER_VERSION" ]]; then
+            echo "Upstream version mismatch: manual=$DOC_VERSION header=$HEADER_VERSION" >&2
+            exit 1
+          fi
+          if [[ ! "$HEADER_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported upstream version string: $HEADER_VERSION" >&2
+            exit 1
+          fi
+
+          SOURCE_TAG="v${HEADER_VERSION}"
+          if [[ "$GITHUB_EVENT_NAME" == 'push' && "$GITHUB_REF_NAME" != "$SOURCE_TAG" ]]; then
+            echo "Pushed tag $GITHUB_REF_NAME does not match upstream source version $SOURCE_TAG." >&2
+            exit 1
+          fi
+
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            REQUESTED_TAG="$INPUT_TAG"
+            [[ "$REQUESTED_TAG" == v* ]] || REQUESTED_TAG="v${REQUESTED_TAG}"
+            if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$REQUESTED_TAG" != "$SOURCE_TAG" ]]; then
+              echo "release_tag must match upstream source version $SOURCE_TAG; received $REQUESTED_TAG." >&2
+              exit 1
+            fi
+          fi
+
+          TARGET_TAG="$SOURCE_TAG"
+          SHOULD_BUILD=true
+          FORCE_BUILD="${FORCE_BUILD:-false}"
+          if [[ "$GITHUB_EVENT_NAME" == 'workflow_dispatch' && "$FORCE_BUILD" != 'true' ]]; then
+            if gh release view "$TARGET_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "Release $TARGET_TAG exists and force_build=false; skipping build."
+              SHOULD_BUILD=false
+            fi
+          fi
+
+          # Best-effort merge to keep this fork's master synchronized. The build
+          # jobs still check out SOURCE_SHA directly, unaffected by merge conflicts.
+          if [[ "$GITHUB_EVENT_NAME" != 'push' ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            if git checkout master 2>/dev/null; then :; else git checkout -b master; fi
+            if git merge --no-edit upstream/master; then
+              if ! git push origin HEAD:master; then
+                echo 'Warning: could not push synced master; build will still use the pinned upstream SHA.'
+              fi
+            else
+              git merge --abort 2>/dev/null || true
+              echo 'Warning: upstream merge conflicted; continuing with the pinned upstream SHA.'
+            fi
+          fi
+
+          echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=${SOURCE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream_date=${SOURCE_DATE}" >> "$GITHUB_OUTPUT"
+          echo "Decision: should_build=$SHOULD_BUILD tag=$TARGET_TAG commit=$SOURCE_SHA ($SOURCE_DATE)"
+
+  build:
+    name: Build ${{ matrix.arch_label }}
+    needs: sync-and-check
+    if: needs.sync-and-check.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch_label: amd64
+            arch_name: x86_64
+            runner: ubuntu-latest
+          - arch_label: arm64
+            arch_name: aarch64
+            runner: ubuntu-24.04-arm
+          - arch_label: arm32
+            arch_name: arm
+            runner: ubuntu-latest
+
+    steps:
+      - name: Checkout the exact upstream commit
+        uses: actions/checkout@v4
+        with:
+          repository: proot-me/proot
+          ref: ${{ needs.sync-and-check.outputs.upstream_sha }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Enable QEMU for Ubuntu ARMv7 container
+        if: matrix.arch_label == 'arm32'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+
+      - name: Build with upstream release.yml recipe on native Ubuntu
+        if: matrix.arch_label != 'arm32'
+        shell: bash
+        env:
+          ARCH_LABEL: ${{ matrix.arch_label }}
+          BIN_NAME: proot-${{ needs.sync-and-check.outputs.release_tag }}-${{ matrix.arch_name }}-static
+          UPSTREAM_TAG: ${{ needs.sync-and-check.outputs.upstream_tag }}
+        run: |
+          set -Eeuo pipefail
+          echo '=== Build environment ==='
+          uname -a
+          dpkg --print-architecture
+          gcc --version | head -n 1
+
+          # Exact dependency list from upstream .github/workflows/release.yml.
+          sudo apt-get update -qq
+          sudo apt-get install -qq libarchive-dev libtalloc-dev pkg-config uthash-dev lzop g++
+
+          # The official x86_64 recipe builds the optional 32-bit x86 loader too.
+          # ARM64 has no x86-specific loader-m32.elf target in the upstream Makefile.
+          if [[ "$ARCH_LABEL" == 'amd64' ]]; then
+            make -C src clean loader.elf loader-m32.elf build.h WITHOUT_PYTHON=1
+          else
+            make -C src clean loader.elf build.h WITHOUT_PYTHON=1
+          fi
+
+          # Same static-link command as upstream release.yml.
+          export LDFLAGS="${LDFLAGS:-}"
+          LDFLAGS="${LDFLAGS} -static" make -C src proot care WITHOUT_PYTHON=1
+
+          # Do not post-process src/proot with strip; publish the linked output verbatim.
+          install -m 0755 src/proot "$GITHUB_WORKSPACE/$BIN_NAME"
+
+      - name: Build with upstream release.yml recipe in Ubuntu 24.04 ARMv7
+        if: matrix.arch_label == 'arm32'
+        shell: bash
+        env:
+          BIN_NAME: proot-${{ needs.sync-and-check.outputs.release_tag }}-${{ matrix.arch_name }}-static
+          UPSTREAM_TAG: ${{ needs.sync-and-check.outputs.upstream_tag }}
+        run: |
+          set -Eeuo pipefail
+          # Ubuntu 24.04's ARM/v7 image uses glibc. Do not use Alpine or musl.
+          # build-essential and git recreate tools already preinstalled on hosted runners.
+          docker run --rm --platform linux/arm/v7 \
+            -e BIN_NAME="$BIN_NAME" \
+            -e UPSTREAM_TAG="$UPSTREAM_TAG" \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace \
+            ubuntu:24.04 bash -euxc '
+              export DEBIAN_FRONTEND=noninteractive
+              export LDFLAGS="${LDFLAGS:-}"
+              apt-get update -qq
+              apt-get install -qq build-essential git libarchive-dev libtalloc-dev pkg-config uthash-dev lzop g++
+              git config --global --add safe.directory /workspace
+
+              # ARMv7 has no x86-specific loader-m32.elf target.
+              make -C src clean loader.elf build.h WITHOUT_PYTHON=1
+              LDFLAGS="${LDFLAGS} -static" make -C src proot care WITHOUT_PYTHON=1
+              install -m 0755 src/proot "/workspace/${BIN_NAME}"
+
+              # Run the ARM binary inside ARMv7/QEMU; the x86_64 host cannot exec it directly.
+              BUILT_VERSION="$(/workspace/${BIN_NAME} --version | grep -oE "v[0-9]+\\.[0-9]+\\.[0-9]+[A-Za-z0-9.-]*" | head -n 1)"
+              case "$BUILT_VERSION" in
+                "$UPSTREAM_TAG"|"$UPSTREAM_TAG"-*) ;;
+                *) echo "Version mismatch: built=$BUILT_VERSION expected prefix=$UPSTREAM_TAG" >&2; exit 1 ;;
+              esac
+              echo "ARMv7 binary version: $BUILT_VERSION"
+              gcc --version | head -n 1
+            '
+
+      - name: Verify ELF architecture, static linkage, and required file size
+        shell: bash
+        env:
+          ARCH_LABEL: ${{ matrix.arch_label }}
+          BIN_NAME: proot-${{ needs.sync-and-check.outputs.release_tag }}-${{ matrix.arch_name }}-static
+          UPSTREAM_TAG: ${{ needs.sync-and-check.outputs.upstream_tag }}
+        run: |
+          set -Eeuo pipefail
+          test -s "$BIN_NAME"
+          chmod 0755 "$BIN_NAME"
+          file "$BIN_NAME"
+          ls -lh "$BIN_NAME"
+
+          SIZE_BYTES="$(stat -c '%s' "$BIN_NAME")"
+          MACHINE="$(readelf -h "$BIN_NAME" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
+          echo "Size: $SIZE_BYTES bytes"
+          echo "ELF machine: $MACHINE"
+
+          case "$ARCH_LABEL" in
+            amd64)
+              [[ "$MACHINE" == *'X86-64'* ]] || { echo "Wrong amd64 machine: $MACHINE" >&2; exit 1; }
+              # GitHub displays file sizes using binary units. These bounds round
+              # to 1.76 MB. Strictly reject other sizes rather than padding bytes.
+              if (( SIZE_BYTES < 1840251 || SIZE_BYTES > 1850736 )); then
+                echo "ERROR: amd64 output would not display as 1.76 MB; actual size is $SIZE_BYTES bytes." >&2
+                echo 'Release blocked. Keep the official build output intact; do not strip or pad it.' >&2
+                exit 1
+              fi
+              ;;
+            arm64)
+              [[ "$MACHINE" == *'AArch64'* ]] || { echo "Wrong arm64 machine: $MACHINE" >&2; exit 1; }
+              if (( SIZE_BYTES <= 1048576 )); then
+                echo "ERROR: arm64 output must exceed 1 MiB; actual size is $SIZE_BYTES bytes." >&2
+                exit 1
+              fi
+              ;;
+            arm32)
+              [[ "$MACHINE" == *'ARM'* ]] || { echo "Wrong arm32 machine: $MACHINE" >&2; exit 1; }
+              if (( SIZE_BYTES <= 1048576 )); then
+                echo "ERROR: arm32 output must exceed 1 MiB; actual size is $SIZE_BYTES bytes." >&2
+                exit 1
+              fi
+              ;;
+          esac
+
+          if readelf -l "$BIN_NAME" | grep -q 'INTERP'; then
+            echo 'ERROR: PT_INTERP is present; binary is not fully static.' >&2
+            exit 1
+          fi
+          if readelf -d "$BIN_NAME" 2>/dev/null | grep -q 'NEEDED'; then
+            echo 'ERROR: DT_NEEDED entries found; binary has shared-library dependencies.' >&2
+            exit 1
+          fi
+
+          if [[ "$ARCH_LABEL" != 'arm32' ]]; then
+            BUILT_VERSION="$(./"$BIN_NAME" --version | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | head -n 1)"
+            case "$BUILT_VERSION" in
+              "$UPSTREAM_TAG"|"$UPSTREAM_TAG"-*) ;;
+              *) echo "Version mismatch: built=$BUILT_VERSION expected prefix=$UPSTREAM_TAG" >&2; exit 1 ;;
+            esac
+            echo "Built version: $BUILT_VERSION"
+          else
+            echo 'ARMv7 --version was verified within the Ubuntu ARM/v7 container.'
+          fi
+
+          echo 'Static-link and size checks passed.'
+
+      - name: Upload architecture binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: proot-bin-${{ matrix.arch_label }}
+          path: proot-${{ needs.sync-and-check.outputs.release_tag }}-${{ matrix.arch_name }}-static
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish Release ${{ needs.sync-and-check.outputs.release_tag }}
+    needs: [sync-and-check, build]
+    if: needs.sync-and-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Download all compiled binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Verify release files and generate SHA256SUMS
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.sync-and-check.outputs.release_tag }}
+        run: |
+          set -Eeuo pipefail
+          cd dist
+          chmod 0755 proot-*-static
+
+          COUNT="$(find . -maxdepth 1 -type f -name 'proot-*-static' | wc -l)"
+          if [[ "$COUNT" -ne 3 ]]; then
+            echo "Expected 3 binaries; found $COUNT." >&2
+            ls -lah
+            exit 1
+          fi
+
+          AMD64_SIZE="$(stat -c '%s' "proot-${RELEASE_TAG}-x86_64-static")"
+          ARM64_SIZE="$(stat -c '%s' "proot-${RELEASE_TAG}-aarch64-static")"
+          ARM32_SIZE="$(stat -c '%s' "proot-${RELEASE_TAG}-arm-static")"
+          if (( AMD64_SIZE < 1840251 || AMD64_SIZE > 1850736 )); then
+            echo "amd64 asset would not display as 1.76 MB: ${AMD64_SIZE} bytes" >&2
+            exit 1
+          fi
+          if (( ARM64_SIZE <= 1048576 || ARM32_SIZE <= 1048576 )); then
+            echo "ARM assets must both exceed 1 MiB: arm64=${ARM64_SIZE}, arm32=${ARM32_SIZE}" >&2
+            exit 1
+          fi
+
+          sha256sum proot-*-static > SHA256SUMS
+          ls -lh
+          cat SHA256SUMS
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.sync-and-check.outputs.release_tag }}
+          target_commitish: master
+          name: PRoot ${{ needs.sync-and-check.outputs.release_tag }} (Official-Style Multi-Arch Static)
+          make_latest: true
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          body: |
+            ### PRoot ${{ needs.sync-and-check.outputs.release_tag }} — upstream release.yml build method
+
+            Built from upstream commit `${{ needs.sync-and-check.outputs.upstream_sha }}` dated `${{ needs.sync-and-check.outputs.upstream_date }}`.
+
+            The build follows `proot-me/proot/.github/workflows/release.yml`: Ubuntu/glibc, upstream dependency list, `WITHOUT_PYTHON=1`, and `LDFLAGS="${LDFLAGS} -static" make -C src proot care WITHOUT_PYTHON=1`. No Alpine Linux, no musl libc, and no post-link `strip` is applied to the final `src/proot` executable. Architecture-specific loader targets are selected according to the upstream Makefile.
+
+            - **amd64 size gate:** must render as 1.76 MB in GitHub Releases; unexpected sizes block publication.
+            - **arm64 and arm32 size gate:** each executable must exceed 1 MiB.
+            - **Static validation:** no ELF `PT_INTERP` or `DT_NEEDED` entries.
+
+            | Architecture | Target | Asset |
+            | --- | --- | --- |
+            | amd64 | x86_64 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-x86_64-static` |
+            | arm64 | AArch64 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-aarch64-static` |
+            | arm32 | ARMv7 / EABI | `proot-${{ needs.sync-and-check.outputs.release_tag }}-arm-static` |
+
+            `SHA256SUMS` contains SHA-256 checksums for all three executables.
+          files: |
+            dist/proot-*-static
+            dist/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
