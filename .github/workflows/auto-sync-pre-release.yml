@@ -1,7 +1,6 @@
-name: Auto Sync & Build Multi-Arch PRoot GPT V2
+name: Auto Sync & Build Multi-Arch PRoot Pre-Release
 
 on:
-  # Monthly: 1st day at 02:28 UTC (10:28 China Standard Time).
   schedule:
     - cron: '28 2 1 * *'
 
