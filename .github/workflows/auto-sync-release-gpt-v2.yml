@@ -17,6 +17,16 @@ on:
         required: false
         default: true
         type: boolean
+      publish_latest:
+        description: 'Mark this GitHub Release as the latest release'
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: 'Mark this GitHub Release as a pre-release'
+        required: false
+        default: false
+        type: boolean
 
   push:
     tags:
@@ -39,6 +49,8 @@ jobs:
       upstream_tag: ${{ steps.check.outputs.upstream_tag }}
       upstream_sha: ${{ steps.check.outputs.upstream_sha }}
       upstream_date: ${{ steps.check.outputs.upstream_date }}
+      publish_latest: ${{ steps.check.outputs.publish_latest }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
     steps:
       - name: Checkout this repository
         uses: actions/checkout@v4
@@ -52,6 +64,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ inputs.release_tag }}
           FORCE_BUILD: ${{ inputs.force_build }}
+          INPUT_PUBLISH_LATEST: ${{ inputs.publish_latest }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -Eeuo pipefail
 
@@ -133,12 +147,22 @@ jobs:
             fi
           fi
 
+          # workflow_dispatch exposes these as booleans. Scheduled/tag-triggered
+          # runs have empty inputs, so retain the safe defaults: latest=true,
+          # prerelease=false.
+          PUBLISH_LATEST="${INPUT_PUBLISH_LATEST:-true}"
+          PRERELEASE="${INPUT_PRERELEASE:-false}"
+          [[ "$PUBLISH_LATEST" == 'true' || "$PUBLISH_LATEST" == 'false' ]] || { echo "Invalid publish_latest value: $PUBLISH_LATEST" >&2; exit 1; }
+          [[ "$PRERELEASE" == 'true' || "$PRERELEASE" == 'false' ]] || { echo "Invalid prerelease value: $PRERELEASE" >&2; exit 1; }
+
           echo "should_build=${SHOULD_BUILD}" >> "$GITHUB_OUTPUT"
           echo "release_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
           echo "upstream_tag=${SOURCE_TAG}" >> "$GITHUB_OUTPUT"
           echo "upstream_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
           echo "upstream_date=${SOURCE_DATE}" >> "$GITHUB_OUTPUT"
-          echo "Decision: should_build=$SHOULD_BUILD tag=$TARGET_TAG commit=$SOURCE_SHA ($SOURCE_DATE)"
+          echo "publish_latest=${PUBLISH_LATEST}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${PRERELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Decision: should_build=$SHOULD_BUILD tag=$TARGET_TAG commit=$SOURCE_SHA ($SOURCE_DATE) latest=$PUBLISH_LATEST prerelease=$PRERELEASE"
 
   build:
     name: Build ${{ matrix.arch_label }}
@@ -372,9 +396,9 @@ jobs:
           tag_name: ${{ needs.sync-and-check.outputs.release_tag }}
           target_commitish: master
           name: PRoot ${{ needs.sync-and-check.outputs.release_tag }} (Official-Style Multi-Arch Static)
-          make_latest: true
+          make_latest: ${{ needs.sync-and-check.outputs.publish_latest }}
           draft: false
-          prerelease: false
+          prerelease: ${{ needs.sync-and-check.outputs.prerelease }}
           overwrite_files: true
           fail_on_unmatched_files: true
           body: |
