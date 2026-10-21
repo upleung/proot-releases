@@ -36,7 +36,7 @@ While the upstream [`proot-me/proot`](https://github.com/proot-me/proot) reposit
 | :--- | :--- | :---: | :--- | :--- |
 | **`amd64`** | `x86_64` | ~1.76 MB | PC, Cloud Servers, Docker/PaaS Containers | `proot-v*-x86_64-static` |
 | **`arm64`** | `aarch64` | ~1.60 MB | ARMv8 Servers, Raspberry Pi 4/5, TV Boxes, Termux | `proot-v*-aarch64-static` |
-| **`arm32`** | `arm` (`armv7l`) | ~1.20 MB | OneCloud (玩客云), 32-bit ARMv7 / armhf Boards | `proot-v*-arm-static` |
+| **`arm32`** | `arm` (`armv7l`) | ~1.20 MB | OneCloud, 32-bit ARMv7 / armhf Boards | `proot-v*-arm-static` |
 
 ## ⚡ Quick Start & Download
 
