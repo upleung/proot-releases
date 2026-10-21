@@ -16,6 +16,16 @@ on:
         required: false
         default: true
         type: boolean
+      publish_latest:
+        description: 'Mark this GitHub Release as the latest release'
+        required: false
+        default: true
+        type: boolean
+      prerelease:
+        description: 'Mark this GitHub Release as a pre-release'
+        required: false
+        default: false
+        type: boolean
 
   push:
     tags:
