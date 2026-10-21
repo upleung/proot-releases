@@ -1,4 +1,4 @@
-name: Auto Sync & Build Multi-Arch PRoot
+name: Auto Sync & Build Multi-Arch PRoot Gemini V2
 
 on:
   # 1. 每月 1 号 UTC 02:28 (北京时间 10:28) 自动拉取同步上游并编译构建
