@@ -305,7 +305,7 @@ jobs:
           draft: false
           prerelease: false
           body: |
-            ### 🌍 English — PRoot ${{ needs.sync-and-check.outputs.release_tag }} Multi-Arch Static Build (Ubuntu glibc)
+            ### 🌎 PRoot ${{ needs.sync-and-check.outputs.release_tag }} Multi-Arch Static Build (Ubuntu glibc)
 
             Strictly built using the official [`proot-me/proot`](https://github.com/proot-me/proot) `release.yml` workflow logic on **Ubuntu 24.04 LTS** (`glibc` + `libtalloc` static linking, unstripped with full symbol tables). Ready to run out-of-the-box on any Linux host or restricted container without root privileges.
 
@@ -319,11 +319,11 @@ jobs:
             | :--- | :--- | :--- | :--- |
             | **`amd64`** | `x86_64` | PC / Cloud Servers / Containers (Intel / AMD 64-bit) | `proot-${{ needs.sync-and-check.outputs.release_tag }}-x86_64-static` |
             | **`arm64`** | `aarch64` | ARMv8 / ARM64 Servers, SBCs, Raspberry Pi 4/5, Android Termux | `proot-${{ needs.sync-and-check.outputs.release_tag }}-aarch64-static` |
-            | **`arm32`** | `arm` (`armv7l`) | OneCloud (玩客云) & 32-bit ARMv7 / armhf Embedded Devices | `proot-${{ needs.sync-and-check.outputs.release_tag }}-arm-static` |
+            | **`arm32`** | `arm` (`armv7l`) | OneCloud & 32-bit ARMv7 / armhf Embedded Devices | `proot-${{ needs.sync-and-check.outputs.release_tag }}-arm-static` |
 
             ---
-
-            ### 🇨🇳 简体中文 — PRoot ${{ needs.sync-and-check.outputs.release_tag }} 多架构官方原版静态构建 (Ubuntu glibc)
+            
+            ### 🌏 PRoot ${{ needs.sync-and-check.outputs.release_tag }} 多架构官方原版静态构建 (Ubuntu glibc)
 
             严格采用上游官方仓库 [`proot-me/proot`](https://github.com/proot-me/proot) 的 `release.yml` 原版构建流程，基于 **Ubuntu 24.04 LTS** (`glibc` + `libtalloc`) 纯静态编译，保留完整调试符号表（未 `strip`），零外部动态库依赖，支持在无 root 权限或受限容器环境下开箱即用。
 
@@ -339,7 +339,6 @@ jobs:
             | **`arm64`** | `aarch64` | ARMv8 / ARM64 服务器、电视盒子、树莓派 4/5、手机 Termux | `proot-${{ needs.sync-and-check.outputs.release_tag }}-aarch64-static` |
             | **`arm32`** | `arm` (`armv7l`) | 玩客云 (OneCloud) 等 32位 ARMv7 / armhf 嵌入式设备 | `proot-${{ needs.sync-and-check.outputs.release_tag }}-arm-static` |
 
-            > 💡 **Verification / 校验说明**: Checksums for all binaries are available in `SHA256SUMS`. / 所有二进制文件的校验和均包含在 `SHA256SUMS` 文件中。
           files: |
             dist/proot-*
             dist/SHA256SUMS
