@@ -1,7 +1,6 @@
-name: Auto Sync & Build Multi-Arch PRoot GPT V2
+name: Auto Sync & Build Multi-Arch PRoot Pre-Release
 
 on:
-  # Monthly: 1st day at 02:28 UTC (10:28 China Standard Time).
   schedule:
     - cron: '28 2 1 * *'
 
@@ -89,7 +88,7 @@ jobs:
           DOC_VERSION="$(git show "${SOURCE_SHA}:doc/proot/manual.rst" | sed -n 's/^:Version:[[:space:]]*//p' | head -n 1 | tr -d '\r')"
           HEADER_VERSION="$(git show "${SOURCE_SHA}:src/cli/proot.h" | sed -n 's/^#define VERSION "\(.*\)"/\1/p' | head -n 1 | tr -d '\r')"
 
-          if [[ -z "$DOC_VERSION" || -z "$HEADER_VERSION" ]]; then
+          if [[ -z "$DOC_VERSION" \vert{}\vert{} -z "$HEADER_VERSION" ]]; then
             echo 'Failed to read the upstream version from manual/header.' >&2
             exit 1
           fi
@@ -104,15 +103,15 @@ jobs:
 
           SOURCE_TAG="v${HEADER_VERSION}"
           if [[ "$GITHUB_EVENT_NAME" == 'push' && "$GITHUB_REF_NAME" != "$SOURCE_TAG" ]]; then
-            echo "Pushed tag $GITHUB_REF_NAME does not match upstream source version $SOURCE_TAG." >&2
+            echo "Pushed tag $GITHUB_REF_NAME does not match upstream source version$SOURCE_TAG." >&2
             exit 1
           fi
 
           if [[ -n "${INPUT_TAG:-}" ]]; then
             REQUESTED_TAG="$INPUT_TAG"
-            [[ "$REQUESTED_TAG" == v* ]] || REQUESTED_TAG="v${REQUESTED_TAG}"
+            [[ "$REQUESTED_TAG" == v* ]] \vert{}\vert{} REQUESTED_TAG="v${REQUESTED_TAG}"
             if [[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$REQUESTED_TAG" != "$SOURCE_TAG" ]]; then
-              echo "release_tag must match upstream source version $SOURCE_TAG; received $REQUESTED_TAG." >&2
+              echo "release_tag must match upstream source version $SOURCE_TAG; received$REQUESTED_TAG." >&2
               exit 1
             fi
           fi
@@ -226,38 +225,38 @@ jobs:
         run: |
           set -Eeuo pipefail
           # Ubuntu 24.04's ARM/v7 image uses glibc. Do not use Alpine or musl.
-          # build-essential and git recreate tools already preinstalled on hosted runners.
-          docker run --rm --platform linux/arm/v7 \
+          # Pass script via single-quoted heredoc (-i) to avoid nested quote termination bugs.
+          docker run --rm -i --platform linux/arm/v7 \
             -e BIN_NAME="$BIN_NAME" \
             -e UPSTREAM_TAG="$UPSTREAM_TAG" \
+            -e HOST_UID="$(id -u)" \
+            -e HOST_GID="$(id -g)" \
             -v "$GITHUB_WORKSPACE:/workspace" \
             -w /workspace \
-            ubuntu:24.04 bash -euxc '
+            ubuntu:24.04 bash -eux <<'EOF'
               export DEBIAN_FRONTEND=noninteractive
               export LDFLAGS="${LDFLAGS:-}"
               apt-get update -qq
-              apt-get install -qq build-essential git libarchive-dev libtalloc-dev pkg-config uthash-dev lzop g++
+              apt-get install -y -qq --no-install-recommends \
+                build-essential git libarchive-dev libtalloc-dev pkg-config uthash-dev lzop g++
               git config --global --add safe.directory /workspace
 
               # ARMv7 has no x86-specific loader-m32.elf target.
               make -C src clean loader.elf build.h WITHOUT_PYTHON=1
-              LDFLAGS="${LDFLAGS} -static" make -C src proot care WITHOUT_PYTHON=1
-              install -m 0755 src/proot "/workspace/${BIN_NAME}"
-              # The container runs as root, so the bind-mounted output would otherwise
-              # be root-owned on the host. Restore the workspace directory's owner so
-              # the runner can chmod, inspect, and upload the binary in later steps.
-              WORKSPACE_OWNER="$(stat -c "%u:%g" /workspace)"
-              chown "$WORKSPACE_OWNER" "/workspace/${BIN_NAME}"
+              LDFLAGS="${LDFLAGS} -static" make -C src -j"$(nproc)" proot care WITHOUT_PYTHON=1
+
+              # Install binary and set host runner ownership atomically to avoid root-owned files on host.
+              install -m 0755 -o "$HOST_UID" -g "$HOST_GID" src/proot "/workspace/${BIN_NAME}"
 
               # Run the ARM binary inside ARMv7/QEMU; the x86_64 host cannot exec it directly.
-              BUILT_VERSION="$(/workspace/${BIN_NAME} --version | grep -oE "v[0-9]+\\.[0-9]+\\.[0-9]+[A-Za-z0-9.-]*" | head -n 1)"
+              BUILT_VERSION="$(/workspace/${BIN_NAME} --version | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | head -n 1)"
               case "$BUILT_VERSION" in
-                "$UPSTREAM_TAG"|"$UPSTREAM_TAG"-*) ;;
+                "$UPSTREAM_TAG"\vert{}"$UPSTREAM_TAG"-*) ;;
                 *) echo "Version mismatch: built=$BUILT_VERSION expected prefix=$UPSTREAM_TAG" >&2; exit 1 ;;
               esac
               echo "ARMv7 binary version: $BUILT_VERSION"
               gcc --version | head -n 1
-            '
+          EOF
 
       - name: Verify ELF architecture, static linkage, and required file size
         shell: bash
@@ -272,7 +271,7 @@ jobs:
           file "$BIN_NAME"
           ls -lh "$BIN_NAME"
 
-          SIZE_BYTES="$(stat -c '%s' "$BIN_NAME")"
+          SIZE_BYTES="$(stat -c '\%s' "$BIN_NAME")"
           MACHINE="$(readelf -h "$BIN_NAME" | sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')"
           echo "Size: $SIZE_BYTES bytes"
           echo "ELF machine: $MACHINE"
@@ -316,7 +315,7 @@ jobs:
           if [[ "$ARCH_LABEL" != 'arm32' ]]; then
             BUILT_VERSION="$(./"$BIN_NAME" --version | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[A-Za-z0-9.-]*' | head -n 1)"
             case "$BUILT_VERSION" in
-              "$UPSTREAM_TAG"|"$UPSTREAM_TAG"-*) ;;
+              "$UPSTREAM_TAG"\vert{}"$UPSTREAM_TAG"-*) ;;
               *) echo "Version mismatch: built=$BUILT_VERSION expected prefix=$UPSTREAM_TAG" >&2; exit 1 ;;
             esac
             echo "Built version: $BUILT_VERSION"
@@ -365,9 +364,9 @@ jobs:
             exit 1
           fi
 
-          AMD64_SIZE="$(stat -c '%s' "proot-${RELEASE_TAG}-x86_64-static")"
-          ARM64_SIZE="$(stat -c '%s' "proot-${RELEASE_TAG}-aarch64-static")"
-          ARM32_SIZE="$(stat -c '%s' "proot-${RELEASE_TAG}-arm-static")"
+          AMD64_SIZE="$(stat -c '\%s' "proot-${RELEASE_TAG}-x86_64-static")"
+          ARM64_SIZE="$(stat -c '\%s' "proot-${RELEASE_TAG}-aarch64-static")"
+          ARM32_SIZE="$(stat -c '\%s' "proot-${RELEASE_TAG}-arm-static")"
           if (( AMD64_SIZE < 1840251 || AMD64_SIZE > 1850736 )); then
             echo "amd64 asset would not display as 1.76 MB: ${AMD64_SIZE} bytes" >&2
             exit 1
